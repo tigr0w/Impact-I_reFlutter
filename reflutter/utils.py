@@ -193,6 +193,7 @@ def replace_flutter_lib(
     libapp_ios: tuple,
     zip_stored: bool,
     patch_dump: bool,
+    no_interact: bool = False,
 ):
     flutter_version_index = check_libapp_hash(libapp_hash)
 
@@ -201,7 +202,10 @@ def replace_flutter_lib(
         flutter_version_index is not None
         and flutter_version_index <= OLD_SOCKET_PATCH_LAST_VERSION
     ):
-        burp_ip = input_burp_ip()
+        if no_interact:
+            burp_ip = "127.0.0.1"
+        else:
+            burp_ip = input_burp_ip()
     get_network_lib(
         libapp_arm64,
         libapp_arm,

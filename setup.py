@@ -31,7 +31,7 @@ setuptools.setup(
     author="impact",
     author_email="routeros7.1@gmail.com",
     url="https://github.com/Impact-I/reFlutter",
-    packages=setuptools.find_packages(),
+    packages=["reflutter"],
     license="GPLv3+",
     platforms=["any"],
     keywords="distutils setuptools egg pip requirements",

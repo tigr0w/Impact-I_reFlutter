@@ -13,10 +13,12 @@ from urllib.request import urlretrieve
 from zipfile import ZipFile
 from os.path import join
 import zipfile
+import glob
 
 # inits
 patch_dump = False
 build_engine = False
+no_interact = False
 
 
 def _patch_file(file_name: str):
@@ -29,6 +31,7 @@ def _patch_file(file_name: str):
     libapp_ios = "", ""
     libapp_hash = ""
     global patch_dump
+    global no_interact
     with ZipFile(file_name, "r") as zip_object:
         list_of_file_names = zip_object.namelist()
         zip_object.extractall("release")
@@ -56,12 +59,37 @@ def _patch_file(file_name: str):
                     zip_stored = True
                 zip_object.extract(file_name, "libappTmp")
                 libapp_x64 = file_name, utils.elff(join("libappTmp", file_name))
-                libapp_hash = libapp_arm[1]
+                libapp_hash = libapp_x64[1]
             if file_name.endswith("86/libflutter.so"):
                 zip_object.extract(file_name, "libappTmp")
                 libapp_x86 = file_name, utils.elff(join("libappTmp", file_name))
-                libapp_hash = libapp_arm[1]
+                libapp_hash = libapp_x86[1]
         zip_object.close()
+        if not libapp_hash:
+            # fallback: scan extracted release/ for libapp.so or App binaries
+            candidates = (
+                glob.glob("release/**/libapp.so", recursive=True)
+                + glob.glob("release/**/App.framework/App", recursive=True)
+                + glob.glob("release/**/FlutterApp.framework/FlutterApp", recursive=True)
+            )
+            for cand in candidates:
+                if "arm64" in cand or "v8a" in cand:
+                    libapp_arm64 = cand, utils.elff(cand)
+                    libapp_hash = libapp_arm64[1]
+                elif "armeabi" in cand or "v7a" in cand:
+                    libapp_arm = cand, utils.elff(cand)
+                    libapp_hash = libapp_arm[1]
+                elif "x86_64" in cand:
+                    libapp_x64 = cand, utils.elff(cand)
+                    libapp_hash = libapp_x64[1]
+                elif "x86" in cand:
+                    libapp_x86 = cand, utils.elff(cand)
+                    libapp_hash = libapp_x86[1]
+                elif "App.framework" in cand or "FlutterApp.framework" in cand:
+                    libapp_ios = cand, utils.elff(cand)
+                    libapp_hash = libapp_ios[1]
+                if libapp_hash:
+                    break
         utils.replace_flutter_lib(
             libapp_hash,
             libapp_arm64,
@@ -71,6 +99,7 @@ def _patch_file(file_name: str):
             libapp_ios,
             zip_stored,
             patch_dump,
+            no_interact,
         )
 
 
@@ -124,6 +153,13 @@ def main():
         default=False,
         help="Enable patch dump",
     )
+    parser.add_argument(
+        "-n",
+        "--no-interact",
+        action="store_true",
+        default=False,
+        help="Skip Burp IP prompt (uses 127.0.0.1 for old engines)",
+    )
     parser.add_argument("target", nargs="?", help="APK or IPA file")
 
     args = parser.parse_args()
@@ -132,6 +168,9 @@ def main():
 
     if args.patch_dump:
         patch_dump = True
+
+    if args.no_interact:
+        no_interact = True
 
     if build_engine:
         _build_engine(args.build_engine)

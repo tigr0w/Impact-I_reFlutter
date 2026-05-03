@@ -1,24 +1,31 @@
-//frida -U -f <package> -l frida.js
+// frida -U -f <package> -l frida.js
+// Offsets come from dump.dart (JSONL format): jq -r '.offset' dump.dart
 
 function hookFunc() {
-  var dumpOffset = "0x20801C"; // _kDartIsolateSnapshotInstructions + code offset
+  var dumpOffset = "0x20801C"; // offset from dump.dart (relative to _kDartIsolateSnapshotInstructions)
 
   var argBufferSize = 150;
 
-  let address;
+  // Get base address of libapp.so — works across Frida 15, 16, and 17
+  var address;
   try {
-      address = Module.findBaseAddress("libapp.so"); // libapp.so (Android) or App (IOS)
+    address = Module.findBaseAddress("libapp.so");        // Frida < 16
+  } catch (_) { /* removed in newer Frida */ }
+
+  if (!address) {
+    try {
+      address = Module.getBaseAddress("libapp.so");       // Frida >= 16
+    } catch (_) { /* fall through */ }
   }
-  catch (e) {
-      if (e instanceof TypeError && e.message === "not a function") {
-          address = Process.findModuleByName("libapp.so");
-          if (address != null) {
-              address = address.base;
-          }
-      }
-      else {
-          throw e;
-      }
+
+  if (!address) {
+    var mod = Process.findModuleByName("libapp.so");      // universal fallback
+    if (mod) address = mod.base;
+  }
+
+  if (!address) {
+    console.log("ERROR: libapp.so not found in process memory");
+    return;
   }
   console.log("\n\nbaseAddress: " + address.toString());
 

@@ -23,4 +23,6 @@ goma/
 .venv/
 *.idsig
 .DS_Store
+.gclient_cache/
+gclient_synced/
 __pycache__/

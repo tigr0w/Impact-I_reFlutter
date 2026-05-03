@@ -1,0 +1,246 @@
+#!/bin/bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SNAPSHOT_HASH=$(cat "$REPO_ROOT/SNAPSHOT_HASH")
+RELEASE_DIR="$REPO_ROOT/release"
+
+# ---- flags ----
+BUILD_V2=true
+BUILD_V3=true
+DO_BUILD=true
+DO_UPLOAD=true
+VERBOSE=false
+
+usage() {
+  cat <<'EOF'
+Usage: local-release [flags]
+
+Flags:
+  --v2-only        Build only engine v2 (reflutter without -p)
+  --v3-only        Build only engine v3 (reflutter with -p)
+  --build-only     Build only; skip gh release upload step
+  --upload-only    Upload existing release/ artifacts; skip build
+  --help           Show this message
+EOF
+  exit 0
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --v2-only) BUILD_V3=false ;;
+    --v3-only) BUILD_V2=false ;;
+    --build-only) DO_UPLOAD=false ;;
+    --upload-only) DO_BUILD=false ;;
+    --verbose) VERBOSE=true ;;
+    --help) usage ;;
+    *) echo "Unknown flag: $arg"; usage ;;
+  esac
+done
+
+if $VERBOSE; then set -x; fi
+
+say()  { echo "==> $(date '+%H:%M:%S')  $*"; }
+warn() { echo "!!! $*" >&2; }
+die()  { warn "$*"; exit 1; }
+
+# ---- guards ----
+command -v brew  >/dev/null 2>&1 || die "brew not found"
+command -v ninja >/dev/null 2>&1 || brew install ninja
+
+if ! gh auth status >/dev/null 2>&1 && [[ -z "${GITHUB_TOKEN:-}" ]]; then
+  die "gh not authenticated — run 'gh auth login' or set GITHUB_TOKEN"
+fi
+
+# ---- install deps ----
+say "Installing build dependencies (brew) …"
+brew install libusbmuxd ideviceinstaller ios-deploy python@3.13 2>/dev/null || true
+
+say "Installing reflutter python package …"
+cd "$REPO_ROOT"
+python3 -m pip install wheel --break-system-packages 2>/dev/null || true
+python3 -m pip install . --break-system-packages 2>/dev/null || true
+
+# ---- compiler wrapper: macOS SDK 26+ deprecates readdir_r; -Werror makes it fatal ----
+# The engine invokes clang via relative paths, so we must replace the bundled binaries.
+inject_clang_wrapper() {
+  local clang_dir="$GCLIENT_DIR/engine/src/flutter/buildtools/mac-arm64/clang/bin"
+  for name in clang clang++; do
+    local real="$clang_dir/$name"
+    if [[ -x "$real" ]] && [[ ! -f "$real.real" ]]; then
+      mv "$real" "$real.real"
+      cat > "$real" << 'CLANG_WRAPPER'
+#!/bin/bash
+exec "${0}.real" "$@" -Wno-deprecated-declarations
+CLANG_WRAPPER
+      chmod +x "$real"
+      say "  Wrapped $name for macOS SDK 26 compatibility"
+    fi
+  done
+}
+
+# ---- depot_tools ----
+if [[ ! -d "$REPO_ROOT/depot_tools" ]]; then
+  say "Cloning depot_tools …"
+  git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$REPO_ROOT/depot_tools"
+fi
+export PATH="$PATH:$REPO_ROOT/depot_tools"
+
+# ---- gclient cache dir (survives between runs, avoids re-cloning deps) ----
+GCLIENT_CACHE="$REPO_ROOT/.gclient_cache"
+mkdir -p "$GCLIENT_CACHE"
+export GIT_CACHE_PATH="$GCLIENT_CACHE"
+
+# ---- prepare flutter engine repo ----
+ENGINE_DIR="$REPO_ROOT/engine"
+if [[ ! -d "$ENGINE_DIR" ]]; then
+  say "Cloning flutter repo (engine source) …"
+  git clone https://github.com/flutter/flutter.git "$ENGINE_DIR"
+fi
+
+# ---- retry helper ----
+retry_gclient() {
+  local max_retries=5
+  local delay=60
+  for i in $(seq 1 $max_retries); do
+    if gclient sync --no-history --delete_unversioned_trees 2>&1; then
+      return 0
+    fi
+    if [[ $i -eq $max_retries ]]; then
+      die "gclient sync failed after $max_retries attempts"
+    fi
+    warn "gclient sync failed (attempt $i/$max_retries) — rate limited. Waiting ${delay}s …"
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+}
+
+# ---- ninja build helper ----
+# Usage: ninja_build "iOS release" "src/out/ios_release" "Flutter.framework/Flutter" "$out/Flutter" --ios
+# First 4 args: label, output-dir, output-file, dest.  Remaining args go to gn (e.g. --ios, --android).
+ninja_build() {
+  local target="$1"
+  local out_dir="$2"
+  local out_file="$3"
+  local dst="$4"
+  shift 4  # now $@ contains only the platform flags for gn
+
+  say "ninja: $target …"
+  "$ENG"/src/flutter/tools/gn --no-goma "$@" --runtime-mode=release
+  ninja -C "$ENG/$out_dir"
+  cp "$ENG/$out_dir/$out_file" "$dst" 2>/dev/null || true
+  say "  -> $dst"
+}
+
+# ---- main build ----
+cd "$REPO_ROOT"
+
+if $DO_BUILD; then
+
+  # === PHASE 1: Prepare the engine source (once) ===
+  say "Preparing Flutter engine source …"
+  cd "$ENGINE_DIR"
+  ENGINE_COMMIT="$(reflutter -b "$SNAPSHOT_HASH")"
+  say "Engine commit: $ENGINE_COMMIT"
+  git fetch origin "$ENGINE_COMMIT"
+  git reset --hard FETCH_HEAD
+  git clean -fdx
+
+  # Apply base patches only (no -p): DEPS fixes, SSL bypass, make_version hash.
+  # The -p flag (dump code, offset fixes) is applied per-variant after gclient sync.
+  reflutter -b "$SNAPSHOT_HASH"
+  echo 'reflutter' > REFLUTTER
+  git add . && git commit -am "reflutter engine" || true
+  git checkout -B main 2>/dev/null || true
+
+  # === PHASE 2: gclient sync (once, shared by both variants) ===
+  GCLIENT_DIR="$REPO_ROOT/gclient_synced"
+  if [[ -d "$GCLIENT_DIR" ]] && [[ -f "$GCLIENT_DIR/.gclient_hash" ]] && \
+     [[ "$(cat "$GCLIENT_DIR/.gclient_hash")" == "$ENGINE_COMMIT" ]]; then
+    say "Reusing cached gclient sync for $ENGINE_COMMIT …"
+  else
+    say "Running gclient sync (this clones 90+ repos, 30+ GB) …"
+    rm -rf "$GCLIENT_DIR"
+    mkdir -p "$GCLIENT_DIR"
+    cd "$GCLIENT_DIR"
+    echo 'solutions = [{"managed": False,"name": ".","url": "'"$ENGINE_DIR"'","custom_deps": {},"deps_file": "DEPS","safesync_url": "",},]' > .gclient
+    retry_gclient
+    echo "$ENGINE_COMMIT" > "$GCLIENT_DIR"/.gclient_hash
+  fi
+
+  inject_clang_wrapper
+
+  ENG="$GCLIENT_DIR/engine"
+
+  # === PHASE 3: Build each variant ===
+  build_variant() {
+    local variant="$1"
+    local reflutter_flags="$2"
+
+    say ""
+    say "========== BUILDING ENGINE $variant =========="
+    local out="$RELEASE_DIR/$variant"
+    mkdir -p "$out"
+
+    # Reset tracked source files to clean gclient-synced state, then re-patch
+    cd "$GCLIENT_DIR"
+    git checkout -- . 2>/dev/null || true
+    reflutter -b "$SNAPSHOT_HASH" $reflutter_flags
+
+    # iOS
+    ninja_build "iOS release" "src/out/ios_release" "Flutter.framework/Flutter" "$out/Flutter" \
+      --ios
+
+    # Android arm64
+    ninja_build "Android arm64" "src/out/android_release_arm64" "lib.stripped/libflutter.so" "$out/libflutter_arm64.so" \
+      --android --android-cpu=arm64
+
+    # Android arm
+    ninja_build "Android arm" "src/out/android_release" "lib.stripped/libflutter.so" "$out/libflutter_arm.so" \
+      --android --android-cpu=arm
+
+    # Android x64
+    ninja_build "Android x64" "src/out/android_release_x64" "lib.stripped/libflutter.so" "$out/libflutter_x64.so" \
+      --android --android-cpu=x64
+
+    say "Engine $variant build complete — artifacts in $out/"
+  }
+
+  # Note: v2 uses just the base patch, v3 adds -p (dump patch)
+  # Both run from the same gclient-synced tree
+  $BUILD_V2 && build_variant "v2" ""
+  $BUILD_V3 && build_variant "v3" "-p"
+
+  say ""
+  say "All builds complete. Artifacts in $RELEASE_DIR/"
+  ls -lh "$RELEASE_DIR"/v2/ 2>/dev/null || true
+  ls -lh "$RELEASE_DIR"/v3/ 2>/dev/null || true
+fi
+
+# ---- upload ----
+if $DO_UPLOAD; then
+  upload_one_variant() {
+    local variant="$1"
+    local out="$RELEASE_DIR/$variant"
+
+    say "Uploading ios-$variant-$SNAPSHOT_HASH …"
+    gh release create "ios-$variant-$SNAPSHOT_HASH" \
+      "$out/Flutter" \
+      --title "iOS $variant – $SNAPSHOT_HASH" \
+      --notes "reFlutter iOS engine build ($variant). Snapshot hash: $SNAPSHOT_HASH" \
+      --repo Impact-I/reFlutter
+
+    say "Uploading android-$variant-$SNAPSHOT_HASH …"
+    gh release create "android-$variant-$SNAPSHOT_HASH" \
+      "$out"/libflutter_arm64.so \
+      "$out"/libflutter_arm.so \
+      "$out"/libflutter_x64.so \
+      --title "Android $variant – $SNAPSHOT_HASH" \
+      --notes "reFlutter Android engine build ($variant). Snapshot hash: $SNAPSHOT_HASH" \
+      --repo Impact-I/reFlutter
+  }
+
+  $BUILD_V2 && upload_one_variant "v2"
+  $BUILD_V3 && upload_one_variant "v3"
+  say "Uploads complete."
+fi
